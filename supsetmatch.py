@@ -23,6 +23,8 @@ from tqdm import trange
 from cta.cta_remixmatch import CTAReMixMatch
 from libml import data, utils, augment, ctaugment
 
+from tensorflow.python.keras.losses import kullback_leibler_divergence
+
 FLAGS = flags.FLAGS
 
 
@@ -41,7 +43,7 @@ class AugmentPoolCTACutOut(augment.AugmentPoolCTA):
         return dict(image=np.stack([x[0]] + [ctaugment.apply(y, cutout_policy()) for y in x[1:]]).astype('f'))
 
 
-class FixMatch(CTAReMixMatch):
+class SupsetMatch(CTAReMixMatch):
     AUGMENT_POOL_CLASS = AugmentPoolCTACutOut
 
     def train(self, train_nimg, report_nimg):
@@ -82,7 +84,7 @@ class FixMatch(CTAReMixMatch):
             while self.tmp.print_queue:
                 print(self.tmp.print_queue.pop(0))
 
-    def model(self, batch, lr, wd, wu, confidence, uratio, ema=0.999, **kwargs):
+    def model(self, batch, lr, wd, wu, confidence, uratio, relax_alpha, ema=0.999, **kwargs):
         hwc = [self.dataset.height, self.dataset.width, self.dataset.colors]
         xt_in = tf.placeholder(tf.float32, [batch] + hwc, 'xt')  # Training labeled
         x_in = tf.placeholder(tf.float32, [None] + hwc, 'x')  # Eval images
@@ -104,20 +106,27 @@ class FixMatch(CTAReMixMatch):
         logits_weak, logits_strong = tf.split(logits[batch:], 2)
         del logits, skip_ops
 
-        ### JL
-        print("Logits weak shape:", logits_weak.shape)
-        print("Logits strong shape:", logits_strong.shape)
-        ###
-
         # Labeled cross-entropy
         loss_xe = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=l_in, logits=logits_x)
         loss_xe = tf.reduce_mean(loss_xe)
         tf.summary.scalar('losses/xe', loss_xe)
 
         # Pseudo-label cross entropy for unlabeled data
+        # Shape logits weak and strong: (batch_size, n_classes)
         pseudo_labels = tf.stop_gradient(tf.nn.softmax(logits_weak))
-        loss_xeu = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=tf.argmax(pseudo_labels, axis=1),
-                                                                  logits=logits_strong)
+        # loss_xeu = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=tf.argmax(pseudo_labels, axis=1),
+        #                                                           logits=logits_strong)
+        pseudo_labels = tf.one_hot(tf.argmax(pseudo_labels, axis=1), depth=tf.shape(pseudo_labels)[1])
+
+        pred_softmax = tf.nn.softmax(logits_strong)
+        sum_y_hat_prime = tf.reduce_sum((1. - pseudo_labels) * pred_softmax, axis=-1)
+        y_pred_hat = relax_alpha * pred_softmax / (tf.expand_dims(sum_y_hat_prime, axis=-1) + 1e-7)
+        y_true_credal = tf.where(tf.greater(pseudo_labels, 0.1), tf.ones_like(pseudo_labels) - relax_alpha, y_pred_hat)
+        divergence = kullback_leibler_divergence(y_true_credal, pred_softmax)
+        preds = tf.reduce_sum(pred_softmax * pseudo_labels, axis=-1)
+        loss_xeu = tf.where(tf.greater_equal(preds, 1. - relax_alpha), tf.zeros_like(divergence),
+                          divergence)
+
         pseudo_mask = tf.to_float(tf.reduce_max(pseudo_labels, axis=1) >= confidence)
         tf.summary.scalar('monitors/mask', tf.reduce_mean(pseudo_mask))
         loss_xeu = tf.reduce_mean(loss_xeu * pseudo_mask)
@@ -148,8 +157,8 @@ def main(argv):
     del argv  # Unused.
     dataset = data.PAIR_DATASETS()[FLAGS.dataset]()
     log_width = utils.ilog2(dataset.width)
-    model = FixMatch(
-        os.path.join(FLAGS.train_dir, dataset.name, FixMatch.cta_name()),
+    model = SupsetMatch(
+        os.path.join(FLAGS.train_dir, dataset.name, SupsetMatch.cta_name()),
         dataset,
         lr=FLAGS.lr,
         wd=FLAGS.wd,
@@ -161,13 +170,15 @@ def main(argv):
         uratio=FLAGS.uratio,
         scales=FLAGS.scales or (log_width - 2),
         filters=FLAGS.filters,
-        repeat=FLAGS.repeat)
-    model.train(FLAGS.train_kimg << 10, FLAGS.report_kimg << 10)
+        repeat=FLAGS.repeat,
+        relax_alpha=FLAGS.relax_alpha)
+    model.train(FLAGS.train_kimg << 7, FLAGS.report_kimg << 7)
 
 
 if __name__ == '__main__':
     utils.setup_tf()
-    flags.DEFINE_float('confidence', 0.95, 'Confidence threshold.')
+    flags.DEFINE_float('confidence', 0.9, 'Confidence threshold.')
+    flags.DEFINE_float('relax_alpha', 0.1, 'Label relaxation alpha parameter.')
     flags.DEFINE_float('wd', 0.0005, 'Weight decay.')
     flags.DEFINE_float('wu', 1, 'Pseudo label loss weight.')
     flags.DEFINE_integer('filters', 32, 'Filter size of convolutions.')
