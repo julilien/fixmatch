@@ -113,10 +113,10 @@ class SupsetMatch(CTAReMixMatch):
 
         # Pseudo-label cross entropy for unlabeled data
         # Shape logits weak and strong: (batch_size, n_classes)
-        pseudo_labels = tf.stop_gradient(tf.nn.softmax(logits_weak))
+        orig_pseudo_labels = tf.stop_gradient(tf.nn.softmax(logits_weak))
         # loss_xeu = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=tf.argmax(pseudo_labels, axis=1),
         #                                                           logits=logits_strong)
-        pseudo_labels = tf.one_hot(tf.argmax(pseudo_labels, axis=1), depth=tf.shape(pseudo_labels)[1])
+        pseudo_labels = tf.one_hot(tf.argmax(orig_pseudo_labels, axis=1), depth=tf.shape(orig_pseudo_labels)[1])
 
         pred_softmax = tf.nn.softmax(logits_strong)
         sum_y_hat_prime = tf.reduce_sum((1. - pseudo_labels) * pred_softmax, axis=-1)
@@ -127,7 +127,7 @@ class SupsetMatch(CTAReMixMatch):
         loss_xeu = tf.where(tf.greater_equal(preds, 1. - relax_alpha), tf.zeros_like(divergence),
                           divergence)
 
-        pseudo_mask = tf.to_float(tf.reduce_max(pseudo_labels, axis=1) >= confidence)
+        pseudo_mask = tf.to_float(tf.reduce_max(orig_pseudo_labels, axis=1) >= confidence)
         tf.summary.scalar('monitors/mask', tf.reduce_mean(pseudo_mask))
         loss_xeu = tf.reduce_mean(loss_xeu * pseudo_mask)
         tf.summary.scalar('losses/xeu', loss_xeu)
