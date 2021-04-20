@@ -21,9 +21,11 @@ from absl import flags
 from tqdm import trange
 
 from cta.cta_remixmatch import CTAReMixMatch
-from libml import data, utils, augment, ctaugment
+from libml import data, utils, augment, ctaugment, layers
 
 from tensorflow.python.keras.losses import kullback_leibler_divergence
+
+from libml.utils import EasyDict
 
 FLAGS = flags.FLAGS
 
@@ -43,7 +45,7 @@ class AugmentPoolCTACutOut(augment.AugmentPoolCTA):
         return dict(image=np.stack([x[0]] + [ctaugment.apply(y, cutout_policy()) for y in x[1:]]).astype('f'))
 
 
-class SupsetMatch(CTAReMixMatch):
+class ReSupsetMatch(CTAReMixMatch):
     AUGMENT_POOL_CLASS = AugmentPoolCTACutOut
 
     def train(self, train_nimg, report_nimg):
@@ -84,7 +86,17 @@ class SupsetMatch(CTAReMixMatch):
             while self.tmp.print_queue:
                 print(self.tmp.print_queue.pop(0))
 
-    def model(self, batch, lr, wd, wu, confidence, uratio, relax_alpha, ema=0.999, **kwargs):
+    def guess_label(self, p_model_y, p_data, p_model, **kwargs):
+        del kwargs
+        # Compute the target distribution.
+        p_ratio = (1e-6 + p_data) / (1e-6 + p_model)
+        p_target = p_model_y * p_ratio
+        p_target /= tf.reduce_sum(p_target, axis=1, keep_dims=True)
+
+        return EasyDict(p_target=p_target, p_model=p_model_y)
+
+
+    def model(self, batch, lr, wd, wu, confidence, uratio, ema=0.999, dbuf=128, **kwargs):
         hwc = [self.dataset.height, self.dataset.width, self.dataset.colors]
         xt_in = tf.placeholder(tf.float32, [batch] + hwc, 'xt')  # Training labeled
         x_in = tf.placeholder(tf.float32, [None] + hwc, 'x')  # Eval images
@@ -114,14 +126,26 @@ class SupsetMatch(CTAReMixMatch):
         # Pseudo-label cross entropy for unlabeled data
         # Shape logits weak and strong: (batch_size, n_classes)
         orig_pseudo_labels = tf.stop_gradient(tf.nn.softmax(logits_weak))
-        # loss_xeu = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=tf.argmax(pseudo_labels, axis=1),
-        #                                                           logits=logits_strong)
         pseudo_labels = tf.one_hot(tf.argmax(orig_pseudo_labels, axis=1), depth=tf.shape(orig_pseudo_labels)[1])
+
+        ## Calculate alpha
+        # Moving average of the current estimated label distribution
+        p_model = layers.PMovingAverage('p_model', self.nclass, dbuf)
+        p_target = layers.PMovingAverage('p_target', self.nclass, dbuf)  # Rectified distribution (only for plotting)
+        # Known (or inferred) true unlabeled distribution
+        p_data = layers.PData(self.dataset)
+        guess = self.guess_label(orig_pseudo_labels, p_data(), p_model())
+        guess_p_target = guess.p_target
+        # guess_p_target = tf.compat.v1.Print(guess_p_target, [guess_p_target], "guess.p_target=", summarize=25)
+        max_prob = tf.math.reduce_max(guess_p_target, axis=-1)
+        relax_alpha = tf.ones_like(max_prob) - max_prob
+        tf.summary.scalar('monitors/alpha', tf.reduce_mean(relax_alpha))
+        # relax_alpha = tf.compat.v1.Print(relax_alpha, [relax_alpha], "relax-alpha=", summarize=25)
 
         pred_softmax = tf.nn.softmax(logits_strong)
         sum_y_hat_prime = tf.reduce_sum((1. - pseudo_labels) * pred_softmax, axis=-1)
-        y_pred_hat = relax_alpha * pred_softmax / (tf.expand_dims(sum_y_hat_prime, axis=-1) + 1e-7)
-        y_true_credal = tf.where(tf.greater(pseudo_labels, 0.1), tf.ones_like(pseudo_labels) - relax_alpha, y_pred_hat)
+        y_pred_hat = tf.expand_dims(relax_alpha, axis=-1) * pred_softmax / (tf.expand_dims(sum_y_hat_prime, axis=-1) + 1e-7)
+        y_true_credal = tf.where(tf.greater(pseudo_labels, 0.1), tf.ones_like(pseudo_labels) - tf.expand_dims(relax_alpha, axis=-1), y_pred_hat)
         divergence = kullback_leibler_divergence(y_true_credal, pred_softmax)
         preds = tf.reduce_sum(pred_softmax * pseudo_labels, axis=-1)
         loss_xeu = tf.where(tf.greater_equal(preds, 1. - relax_alpha), tf.zeros_like(divergence),
@@ -130,7 +154,9 @@ class SupsetMatch(CTAReMixMatch):
         pseudo_mask = tf.to_float(tf.reduce_max(orig_pseudo_labels, axis=1) >= confidence)
         tf.summary.scalar('monitors/mask', tf.reduce_mean(pseudo_mask))
         loss_xeu = tf.reduce_mean(loss_xeu * pseudo_mask)
+        # loss_xeu = tf.reduce_mean(loss_xeu)
         tf.summary.scalar('losses/xeu', loss_xeu)
+        self.distribution_summary(p_data(), p_model(), p_target())
 
         # L2 regularization
         loss_wd = sum(tf.nn.l2_loss(v) for v in utils.model_vars('classify') if 'kernel' in v.name)
@@ -139,7 +165,9 @@ class SupsetMatch(CTAReMixMatch):
         ema = tf.train.ExponentialMovingAverage(decay=ema)
         ema_op = ema.apply(utils.model_vars())
         ema_getter = functools.partial(utils.getter_ema, ema)
-        post_ops.append(ema_op)
+        post_ops.extend([ema_op,
+                         p_model.update(guess.p_model),
+                         p_target.update(guess.p_target)])
 
         train_op = tf.train.MomentumOptimizer(lr, 0.9, use_nesterov=True).minimize(
             loss_xe + wu * loss_xeu + wd * loss_wd, colocate_gradients_with_ops=True)
@@ -153,12 +181,14 @@ class SupsetMatch(CTAReMixMatch):
 
 
 def main(argv):
+    print("FLAGS.arch:", FLAGS.arch)
+
     utils.setup_main()
     del argv  # Unused.
     dataset = data.PAIR_DATASETS()[FLAGS.dataset]()
     log_width = utils.ilog2(dataset.width)
-    model = SupsetMatch(
-        os.path.join(FLAGS.train_dir, dataset.name, SupsetMatch.cta_name()),
+    model = ReSupsetMatch(
+        os.path.join(FLAGS.train_dir, dataset.name, ReSupsetMatch.cta_name()),
         dataset,
         lr=FLAGS.lr,
         wd=FLAGS.wd,
@@ -170,31 +200,29 @@ def main(argv):
         uratio=FLAGS.uratio,
         scales=FLAGS.scales or (log_width - 2),
         filters=FLAGS.filters,
-        repeat=FLAGS.repeat,
-        relax_alpha=FLAGS.relax_alpha)
+        repeat=FLAGS.repeat)
 
-    # # Count trainable parameters
-    # total_parameters = 0
-    # for variable in tf.trainable_variables():
-    #     # shape is an array of tf.Dimension
-    #     shape = variable.get_shape()
-    #     # print(shape)
-    #     # print(len(shape))
-    #     variable_parameters = 1
-    #     for dim in shape:
-    #         # print(dim)
-    #         variable_parameters *= dim.value
-    #     # print(variable_parameters)
-    #     total_parameters += variable_parameters
-    # print("=== Trainable parameters:", total_parameters)
+    # Count trainable parameters
+    total_parameters = 0
+    for variable in tf.trainable_variables():
+        # shape is an array of tf.Dimension
+        shape = variable.get_shape()
+        # print(shape)
+        # print(len(shape))
+        variable_parameters = 1
+        for dim in shape:
+            # print(dim)
+            variable_parameters *= dim.value
+        # print(variable_parameters)
+        total_parameters += variable_parameters
+    print("=== Trainable parameters:", total_parameters)
 
     model.train(FLAGS.train_kimg << 10, FLAGS.report_kimg << 10)
 
 
 if __name__ == '__main__':
     utils.setup_tf()
-    flags.DEFINE_float('confidence', 0.9, 'Confidence threshold.')
-    flags.DEFINE_float('relax_alpha', 0.1, 'Label relaxation alpha parameter.')
+    flags.DEFINE_float('confidence', 0.0, 'Confidence threshold.')
     flags.DEFINE_float('wd', 0.0005, 'Weight decay.')
     flags.DEFINE_float('wu', 1, 'Pseudo label loss weight.')
     flags.DEFINE_integer('filters', 32, 'Filter size of convolutions.')
