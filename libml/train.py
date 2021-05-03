@@ -22,6 +22,7 @@ import tensorflow.compat.v1 as tf
 from absl import flags
 from tqdm import trange, tqdm
 
+from jl_utils import calculate_ece
 from libml import data, utils
 from libml.utils import EasyDict
 
@@ -185,8 +186,8 @@ class ClassifySemi(Model):
         raw = self.eval_stats(classify_op=self.ops.classify_raw)
         ema = self.eval_stats(classify_op=self.ops.classify_op)
         print('%16s %8s %8s %8s' % ('', 'labeled', 'valid', 'test'))
-        print('%16s %8s %8s %8s' % (('raw',) + tuple('%.2f' % x for x in raw)))
-        print('%16s %8s %8s %8s' % (('ema',) + tuple('%.2f' % x for x in ema)))
+        print('%16s %8s/%8s %8s/%8s %8s/%8s' % (('raw',) + tuple('%.3f' % x for x in raw)))
+        print('%16s %8s/%8s %8s/%8s %8s/%8s' % (('ema',) + tuple('%.3f' % x for x in ema)))
 
     def cache_eval(self):
         """Cache datasets for computing eval stats."""
@@ -235,8 +236,14 @@ class ClassifySemi(Model):
                 predicted.append(p)
             predicted = np.concatenate(predicted, axis=0)
             accuracies.append((predicted.argmax(1) == labels).mean() * 100)
+
+            # Calculate expected calibration error (ECE) with 15 bins
+            ece = calculate_ece(predicted, labels)
+
+            accuracies.append(ece)
+
         if verbose:
-            self.train_print('kimg %-5d  accuracy train/valid/test  %.2f  %.2f  %.2f' %
+            self.train_print('kimg %-5d  accuracy/ece train/valid/test  %.3f/%.3f  %.3f/%.3f  %.3f/%.3f' %
                              tuple([self.tmp.step >> 10] + accuracies))
         return np.array(accuracies, 'f')
 
@@ -248,12 +255,23 @@ class ClassifySemi(Model):
 
         accuracies = tf.py_func(functools.partial(gen_stats), [], tf.float32)
         tf.summary.scalar('accuracy/train_labeled', accuracies[0])
-        tf.summary.scalar('accuracy/valid', accuracies[1])
-        tf.summary.scalar('accuracy', accuracies[2])
+        tf.summary.scalar('ece/train_labeled', accuracies[1])
+
+        tf.summary.scalar('accuracy/valid', accuracies[2])
+        tf.summary.scalar('ece/valid', accuracies[3])
+
+        tf.summary.scalar('accuracy', accuracies[4])
+        tf.summary.scalar('ece/accuracy', accuracies[5])
+
         if 'classify_raw' in self.ops:
             accuracies = tf.py_func(functools.partial(gen_stats,
                                                       classify_op=self.ops.classify_raw,
                                                       verbose=False), [], tf.float32)
             tf.summary.scalar('accuracy/raw/train_labeled', accuracies[0])
-            tf.summary.scalar('accuracy/raw/valid', accuracies[1])
-            tf.summary.scalar('accuracy/raw', accuracies[2])
+            tf.summary.scalar('ece/raw/train_labeled', accuracies[1])
+
+            tf.summary.scalar('accuracy/raw/valid', accuracies[2])
+            tf.summary.scalar('ece/raw/valid', accuracies[3])
+
+            tf.summary.scalar('accuracy/raw', accuracies[4])
+            tf.summary.scalar('ece/raw', accuracies[5])

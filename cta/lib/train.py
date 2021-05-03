@@ -16,6 +16,7 @@ import numpy as np
 from absl import flags
 
 from fully_supervised.lib.train import ClassifyFullySupervised
+from jl_utils import calculate_ece
 from libml import data
 from libml.augment import AugmentPoolCTA
 from libml.ctaugment import CTAugment
@@ -94,8 +95,13 @@ class CTAClassifySemi(ClassifySemi):
                 predicted.append(p)
             predicted = np.concatenate(predicted, axis=0)
             accuracies.append((predicted.argmax(1) == labels).mean() * 100)
+
+            # Calculate expected calibration error (ECE) with 15 bins
+            ece = calculate_ece(predicted, labels)
+
+            accuracies.append(ece)
         if verbose:
-            self.train_print('kimg %-5d  accuracy train/valid/test  %.2f  %.2f  %.2f' %
+            self.train_print('kimg %-5d  accuracy/ece train/valid/test  %.3f/%.3f  %.3f/%.3f  %.3f/%.3f' %
                              tuple([self.tmp.step >> 10] + accuracies))
         self.train_print(self.augmenter.stats())
         return np.array(accuracies, 'f')
